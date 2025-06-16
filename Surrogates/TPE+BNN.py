@@ -2,8 +2,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import Matern
 import optuna
 from optuna.samplers import TPESampler
 from scipy.stats import norm
@@ -34,27 +32,17 @@ def expected_improvement(mu: np.ndarray, sigma: np.ndarray, mu_sample_opt: float
         ei[sigma == 0.0] = 0.0
     return ei
 
-# Propose next x by maximizing acquisition over random candidates
-def propose_acquisition(acq_func, gp, X_sample, Y_sample, bounds, xi=0.01, n_cand=5000):
-    X_cand = np.random.uniform(bounds[0], bounds[1], size=(n_cand, 1))
-    mu, sigma = gp.predict(X_cand, return_std=True)
-    mu_sample_opt = np.max(Y_sample)
-    vals = acq_func(mu, sigma, mu_sample_opt, xi)
-    return X_cand[np.argmax(vals)]
-
 # Simple Bayesian Neural Network via MC Dropout
 class BNN(nn.Module):
     def __init__(self, layers=[1, 50, 50, 1], dropout=0.1):
         super().__init__()
         self.dropout = dropout
-        self.fcs = nn.ModuleList()
-        for i in range(len(layers) - 1):
-            self.fcs.append(nn.Linear(layers[i], layers[i + 1]))
+        self.fcs = nn.ModuleList([nn.Linear(layers[i], layers[i+1]) for i in range(len(layers)-1)])
 
     def forward(self, x):
         for i, fc in enumerate(self.fcs):
             x = fc(x)
-            if i < len(self.fcs) - 1:
+            if i < len(self.fcs)-1:
                 x = F.relu(x)
                 x = F.dropout(x, p=self.dropout, training=True)
         return x
@@ -79,26 +67,9 @@ if __name__ == '__main__':
     X = np.random.uniform(bounds[0], bounds[1], size=(n_init, 1))
     Y = np.array([black_box(x[0]) for x in X]).reshape(-1, 1)
 
-    # GP surrogate
-    gp = GaussianProcessRegressor(kernel=Matern(nu=2.5), alpha=1e-6, normalize_y=True)
-    gp.fit(X, Y)
-
-    # Optuna TPE study optimizing Probability of Improvement on GP
-    def gp_objective(trial):
-        x = trial.suggest_uniform('x', bounds[0], bounds[1])
-        lam = schedule_lambda(trial.number + 1, budget)
-        mu, sigma = gp.predict(np.array([[x]]), return_std=True)
-        pi = probability_improvement(mu, sigma, np.max(Y), xi=0.01)[0]
-        return pi
-
-    study_pi = optuna.create_study(direction='maximize', sampler=TPESampler())
-    study_pi.optimize(gp_objective, n_trials=budget)
-    print(f"Best PI via TPE: x={study_pi.best_params['x']:.4f}, PI={study_pi.best_value:.4f}")
-
-    # Bayesian Neural Net surrogate + EI/PI
+    # Initialize and train BNN surrogate
     bnn = BNN()
     optimizer = torch.optim.Adam(bnn.parameters(), lr=1e-2)
-    # Train BNN on initial data
     for epoch in range(2000):
         optimizer.zero_grad()
         preds = bnn(torch.tensor(X, dtype=torch.float32)).reshape(-1, 1)
@@ -106,12 +77,13 @@ if __name__ == '__main__':
         loss.backward()
         optimizer.step()
 
-    # Evaluate acquisition over grid
+    # Evaluate acquisition (EI and PI) over a grid
     X_grid = np.linspace(bounds[0], bounds[1], 500).reshape(-1, 1)
     mu_bnn, sigma_bnn = bnn_predict(bnn, X_grid)
     mu_star = np.max(Y)
     ei_vals = expected_improvement(mu_bnn, sigma_bnn, mu_star)
     pi_vals = probability_improvement(mu_bnn, sigma_bnn, mu_star)
+
     x_ei = X_grid[np.argmax(ei_vals)][0]
     x_pi = X_grid[np.argmax(pi_vals)][0]
 
